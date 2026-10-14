@@ -1,24 +1,19 @@
 /**
  * Reportli Planner Cron Worker
- * Version: 2.0.0
+ * Version: 3.0.0
  *
  * PURPOSE:
- * Runs every 2 minutes.
+ * Runs every 2 minutes and checks whether each application
+ * needs a new Reddit or Apollo task.
  *
- * WORKFLOW:
- * 1. Fetch applications from Supabase.
- * 2. Check the latest Reddit task for each application.
- * 3. Check the latest Apollo task for each application.
- * 4. Create a task if no task exists.
- * 5. Create a new task if the latest task has pending_count = 0.
- * 6. Skip task creation while the latest task is still pending.
+ * RULES:
+ * 1. If no task exists, request a new task.
+ * 2. If the latest task has pending_count = 0, request a new task.
+ * 3. Otherwise, skip creating a duplicate task.
  *
  * REQUIRED SECRETS:
  * SUPABASE_URL
  * SUPABASE_SERVICE_ROLE_KEY
- *
- * EXISTING PLANNER WORKER:
- * https://reportli-ai-planner.reportliaihq.workers.dev/create-task
  */
 
 // ============================================================
@@ -36,31 +31,34 @@ const REQUEST_TIMEOUT_MS = 20000;
 
 
 // ============================================================
-// MAIN WORKER EXPORT
-// IMPORTANT: Cloudflare requires the scheduled() handler.
+// WORKER ENTRY POINT
 // ============================================================
 
 export default {
   // ----------------------------------------------------------
   // HTTP HANDLER
-  // GET /health  -> Health check
-  // POST /run    -> Manually execute the cron workflow
   // ----------------------------------------------------------
 
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health" && request.method === "GET") {
+    if (
+      url.pathname === "/health" &&
+      request.method === "GET"
+    ) {
       return Response.json({
         success: true,
         worker: "reportli-planner-cron",
         message: "Worker is running",
-        cron_schedule: "*/2 * * * *",
+        cron: "*/2 * * * *",
         timestamp: new Date().toISOString(),
       });
     }
 
-    if (url.pathname === "/run" && request.method === "POST") {
+    if (
+      url.pathname === "/run" &&
+      request.method === "POST"
+    ) {
       try {
         const result = await runCron(env);
 
@@ -68,7 +66,10 @@ export default {
           status: result.errors.length > 0 ? 207 : 200,
         });
       } catch (error) {
-        console.error("Manual run failed:", error.message);
+        console.error(
+          "Manual cron execution failed:",
+          error.message
+        );
 
         return Response.json(
           {
@@ -83,7 +84,7 @@ export default {
     return Response.json(
       {
         success: false,
-        error: "Route not found.",
+        error: "Route not found",
         available_routes: [
           "GET /health",
           "POST /run",
@@ -94,9 +95,7 @@ export default {
   },
 
   // ----------------------------------------------------------
-  // SCHEDULED HANDLER
-  // This fixes:
-  // "Handler does not export a scheduled() function"
+  // REQUIRED CLOUDFLARE CRON HANDLER
   // ----------------------------------------------------------
 
   async scheduled(controller, env, ctx) {
@@ -113,19 +112,15 @@ export default {
 
 
 // ============================================================
-// CRON WORKFLOW
+// MAIN CRON WORKFLOW
 // ============================================================
 
 async function runCron(env) {
   validateEnvironment(env);
 
-  const startedAt = new Date().toISOString();
-
-  console.log("Reportli planner cron started:", startedAt);
-
   const result = {
     success: true,
-    started_at: startedAt,
+    started_at: new Date().toISOString(),
     applications_checked: 0,
     tasks_checked: 0,
     tasks_created: 0,
@@ -133,57 +128,56 @@ async function runCron(env) {
     errors: [],
   };
 
-  // ----------------------------------------------------------
-  // STEP 1: Fetch applications
-  // ----------------------------------------------------------
+  console.log("========================================");
+  console.log("REPORTLI PLANNER CRON STARTED");
+  console.log("Time:", result.started_at);
+  console.log("========================================");
+
+  // STEP 1: Load applications from Supabase.
 
   const applications = await getApplications(env);
 
   result.applications_checked = applications.length;
 
   console.log(
-    `Found ${applications.length} applications`
+    "Applications found:",
+    applications.length
   );
 
-  // ----------------------------------------------------------
-  // STEP 2: Check Reddit and Apollo tasks
-  // ----------------------------------------------------------
+  // STEP 2: Process each application.
 
   for (const application of applications) {
     const applicationId = application.id;
 
     if (!applicationId) {
       result.errors.push({
-        application_id: null,
-        error: "Application is missing its id",
+        error: "Application is missing its ID",
       });
 
       continue;
     }
 
+    // STEP 3: Process Reddit and Apollo independently.
+
     for (const source of TASK_SOURCES) {
       result.tasks_checked++;
 
       try {
-        console.log(
-          `Checking application ${applicationId}, source ${source}`
-        );
+        console.log("----------------------------------------");
+        console.log("Application:", applicationId);
+        console.log("Source:", source);
 
-        // Find the latest task for this application and source.
         const latestTask = await getLatestTask(
           env,
           applicationId,
           source
         );
 
-        // ----------------------------------------------------
-        // CASE 1: No task exists
-        // Create the first task.
-        // ----------------------------------------------------
+        // CASE 1: No previous task exists.
 
-        if (!latestTask) {
+        if (latestTask === null) {
           console.log(
-            `No ${source} task found for ${applicationId}`
+            "No existing task. Requesting a new task."
           );
 
           await createPlannerTask(
@@ -196,10 +190,7 @@ async function runCron(env) {
           continue;
         }
 
-        // ----------------------------------------------------
-        // CASE 2: Latest task has pending_count = 0
-        // Create the next task.
-        // ----------------------------------------------------
+        // CASE 2: The latest task is completed.
 
         const pendingCount = Number(
           latestTask.pending_count
@@ -212,7 +203,7 @@ async function runCron(env) {
           pendingCount === 0
         ) {
           console.log(
-            `Latest ${source} task is complete for ${applicationId}`
+            "Latest task is complete. Requesting another task."
           );
 
           await createPlannerTask(
@@ -225,23 +216,21 @@ async function runCron(env) {
           continue;
         }
 
-        // ----------------------------------------------------
-        // CASE 3: Task is still pending, or its count is unknown
-        // Do not create a duplicate task.
-        // ----------------------------------------------------
+        // CASE 3: Task is pending or its state is unknown.
 
         console.log(
-          `Skipping ${source} for ${applicationId}. ` +
-          `pending_count=${latestTask.pending_count}`
+          "Skipping task creation. pending_count:",
+          latestTask.pending_count
         );
 
         result.tasks_skipped++;
 
       } catch (error) {
         console.error(
-          `Task processing failed for application ${applicationId}, ` +
-          `source ${source}:`,
-          error.message
+          "Task processing failed:",
+          "application =", applicationId,
+          "source =", source,
+          "error =", error.message
         );
 
         result.errors.push({
@@ -253,24 +242,20 @@ async function runCron(env) {
     }
   }
 
-  // ----------------------------------------------------------
-  // STEP 3: Finish
-  // ----------------------------------------------------------
-
   result.finished_at = new Date().toISOString();
   result.success = result.errors.length === 0;
 
-  console.log(
-    "Reportli planner cron finished:",
-    JSON.stringify(result)
-  );
+  console.log("========================================");
+  console.log("REPORTLI PLANNER CRON FINISHED");
+  console.log(JSON.stringify(result));
+  console.log("========================================");
 
   return result;
 }
 
 
 // ============================================================
-// ENVIRONMENT VALIDATION
+// VALIDATE ENVIRONMENT VARIABLES
 // ============================================================
 
 function validateEnvironment(env) {
@@ -289,22 +274,26 @@ function validateEnvironment(env) {
 
 
 // ============================================================
-// SUPABASE REQUEST HELPER
+// SUPABASE REST API HELPER
 // ============================================================
 
 async function supabaseRequest(env, path) {
   const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
 
-  const url = `${baseUrl}/rest/v1/${path}`;
+  const url =
+    `${baseUrl}/rest/v1/${path}`;
 
   const response = await fetchWithTimeout(
     url,
     {
       method: "GET",
+
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+
         Authorization:
           `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+
         Accept: "application/json",
       },
     }
@@ -314,8 +303,7 @@ async function supabaseRequest(env, path) {
 
   if (!response.ok) {
     throw new Error(
-      `Supabase request failed (${response.status}): ` +
-      responseText
+      `Supabase HTTP ${response.status}: ${responseText}`
     );
   }
 
@@ -334,11 +322,8 @@ async function supabaseRequest(env, path) {
 // ============================================================
 // FETCH APPLICATIONS
 //
-// Expected table:
-// applications
-//
-// Expected column:
-// id
+// Expected table: applications
+// Expected column: id
 // ============================================================
 
 async function getApplications(env) {
@@ -348,28 +333,28 @@ async function getApplications(env) {
     limit: String(MAX_APPLICATIONS),
   });
 
-  const applications = await supabaseRequest(
+  const rows = await supabaseRequest(
     env,
     `applications?${query.toString()}`
   );
 
-  if (!Array.isArray(applications)) {
+  if (!Array.isArray(rows)) {
     throw new Error(
-      "Supabase applications response is not an array"
+      "Applications response is not an array"
     );
   }
 
-  return applications;
+  return rows;
 }
 
 
 // ============================================================
-// GET LATEST TASK
+// GET LATEST TASK FOR AN APPLICATION AND SOURCE
 //
-// Expected table:
-// planner_runs
+// Expected table: planner_runs
 //
 // Expected columns:
+// id
 // application_id
 // source
 // pending_count
@@ -385,13 +370,17 @@ async function getLatestTask(
     select:
       "id,application_id,source,pending_count,created_at",
 
-    application_id: `eq.${applicationId}`,
+    application_id:
+      `eq.${applicationId}`,
 
-    source: `eq.${source}`,
+    source:
+      `eq.${source}`,
 
-    order: "created_at.desc",
+    order:
+      "created_at.desc",
 
-    limit: "1",
+    limit:
+      "1",
   });
 
   const rows = await supabaseRequest(
@@ -401,7 +390,7 @@ async function getLatestTask(
 
   if (!Array.isArray(rows)) {
     throw new Error(
-      "Supabase planner_runs response is not an array"
+      "Planner runs response is not an array"
     );
   }
 
@@ -410,20 +399,19 @@ async function getLatestTask(
 
 
 // ============================================================
-// CREATE TASK THROUGH THE EXISTING PLANNER WORKER
+// CREATE TASK THROUGH reportli-ai-planner
 //
-// The planner worker must accept:
 // POST /create-task
 //
-// JSON body:
+// Reddit JSON:
 // {
-//   "application_id": "your-application-id",
+//   "application_id": "app-123",
 //   "source": "reddit"
 // }
 //
-// Or:
+// Apollo JSON:
 // {
-//   "application_id": "your-application-id",
+//   "application_id": "app-123",
 //   "source": "apollo"
 // }
 // ============================================================
@@ -434,22 +422,34 @@ async function createPlannerTask(
 ) {
   if (!TASK_SOURCES.includes(source)) {
     throw new Error(
-      `Invalid task source: ${source}`
+      `Invalid source: ${source}`
     );
   }
 
+  if (
+    applicationId === null ||
+    applicationId === undefined ||
+    String(applicationId).trim() === ""
+  ) {
+    throw new Error(
+      "Cannot create a task without an application ID"
+    );
+  }
+
+  // Build the exact JSON expected by the planner Worker.
+
   const payload = {
     application_id: String(applicationId),
-    source,
+    source: source,
   };
 
-  // Convert the payload into valid JSON exactly once.
   const requestBody = JSON.stringify(payload);
 
-  console.log(
-    "Sending task request:",
-    requestBody
-  );
+  console.log("========================================");
+  console.log("SENDING POST TO PLANNER WORKER");
+  console.log("URL:", PLANNER_CREATE_TASK_URL);
+  console.log("Body:", requestBody);
+  console.log("========================================");
 
   const response = await fetchWithTimeout(
     PLANNER_CREATE_TASK_URL,
@@ -468,11 +468,12 @@ async function createPlannerTask(
   const responseText = await response.text();
 
   console.log(
-    `Planner worker returned HTTP ${response.status}`
+    "Planner HTTP status:",
+    response.status
   );
 
   console.log(
-    "Planner worker response:",
+    "Planner response:",
     responseText.slice(0, 2000)
   );
 
@@ -483,36 +484,36 @@ async function createPlannerTask(
     );
   }
 
-  // Verify that the endpoint returned JSON.
-  let responseData;
+  let data;
 
   try {
-    responseData = JSON.parse(responseText);
+    data = JSON.parse(responseText);
   } catch {
     throw new Error(
-      "Planner worker returned a non-JSON response: " +
+      "Planner returned invalid JSON: " +
       responseText.slice(0, 500)
     );
   }
 
-  // Some APIs return HTTP 200 with success: false.
-  if (responseData.success === false) {
+  if (data.success === false) {
     throw new Error(
-      responseData.error ||
-      "Planner worker reported that task creation failed"
+      data.error ||
+      "Planner reported task creation failure"
     );
   }
 
   console.log(
-    `Task creation request completed for ${applicationId}, ${source}`
+    "Planner task request succeeded for:",
+    applicationId,
+    source
   );
 
-  return responseData;
+  return data;
 }
 
 
 // ============================================================
-// FETCH WITH TIMEOUT
+// FETCH HELPER WITH TIMEOUT
 // ============================================================
 
 async function fetchWithTimeout(
@@ -542,4 +543,4 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timeout);
   }
-}
+    }
