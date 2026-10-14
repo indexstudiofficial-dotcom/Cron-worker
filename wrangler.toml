@@ -1,0 +1,6 @@
+name = "reportli-planner-cron"
+main = "src/index.js"
+compatibility_date = "2026-10-14"
+
+[triggers]
+crons = ["*/2 * * * *"]
